@@ -2289,7 +2289,8 @@ void testHeaderBorderEdges() {
   // The themed header supplies a 1px divider when the theme's popup style has
   // no border of its own, so default headers match the documented divider.
   screen.header("Top");
-  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Line), 1u);
+  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Fill), 2u);
+  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Line), 0u);
   CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Stroke), 0u);
 
   FakeDrawTarget boxedDraw;

@@ -155,6 +155,7 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   bool longWait = false;
   bool hookFired = false;
   bool x3SawLow = false;
+  bool timedOut = false;
 
   if (p == BusyPolarity::ActiveHigh) {
     while (digitalRead(_pins.busy) == HIGH) {
@@ -166,7 +167,10 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
           _busyWaitBeginHook();
         }
       }
-      if (millis() - start > 30000) break;
+      if (millis() - start > 30000) {
+        timedOut = true;
+        break;
+      }
     }
   } else if (p == BusyPolarity::ActiveLow) {
     bool busy = digitalRead(_pins.busy) == LOW;
@@ -189,7 +193,10 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
             _busyWaitBeginHook();
           }
         }
-        if (millis() - start > 30000) break;
+        if (millis() - start > 30000) {
+          timedOut = true;
+          break;
+        }
       } while (digitalRead(_pins.busy) == LOW);
     }
   } else {  // X3TwoPhase: wait for the LOW edge, then wait back to HIGH
@@ -208,7 +215,10 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
             _busyWaitBeginHook();
           }
         }
-        if (millis() - start > 30000) break;
+        if (millis() - start > 30000) {
+          timedOut = true;
+          break;
+        }
       }
     }
   }
@@ -217,7 +227,11 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   if (p == BusyPolarity::X3TwoPhase && !x3SawLow) return;
 
   if (tag && Serial) {
-    Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), tag, millis() - start);
+    if (timedOut) {
+      Serial.printf("[%lu]   Wait timed out: %s (%lu ms)\n", millis(), tag, millis() - start);
+    } else {
+      Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), tag, millis() - start);
+    }
   }
 }
 
