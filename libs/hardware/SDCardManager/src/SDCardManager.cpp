@@ -119,6 +119,26 @@ bool SDCardManager::ready() const {
   return initialized;
 }
 
+bool SDCardManager::probeMedia() {
+  if (!initialized) return false;
+
+#if FREEINK_SD_SDMMC
+  uint8_t sector[512];
+  const bool available = _dev && _dev->readSector(0, sector);
+#else
+  uint32_t ocr = 0;
+  const bool available = sd.card() && sd.card()->readOCR(&ocr);
+#endif
+  if (available) return true;
+
+  initialized = false;
+  cachedTotalBytes = 0;
+  cachedUsedBytes = 0;
+  cachedUsedBytesValid = false;
+  if (Serial) Serial.printf("[%lu] [SD] Card no longer responding; filesystem disabled until remount\n", millis());
+  return false;
+}
+
 std::vector<String> SDCardManager::listFiles(const char* path, const int maxFiles) {
   std::vector<String> ret;
   if (!initialized) {
@@ -283,6 +303,7 @@ bool SDCardManager::ensureDirectoryExists(const char* path) {
 }
 
 bool SDCardManager::openFileForRead(const char* moduleName, const char* path, FsFile& file) {
+  if (!initialized) return false;
   if (!vol().exists(path)) {
     if (Serial) Serial.printf("[%lu] [%s] File does not exist: %s\n", millis(), moduleName, path);
     return false;
@@ -305,6 +326,7 @@ bool SDCardManager::openFileForRead(const char* moduleName, const String& path, 
 }
 
 bool SDCardManager::openFileForWrite(const char* moduleName, const char* path, FsFile& file) {
+  if (!initialized) return false;
   file = vol().open(path, O_RDWR | O_CREAT | O_TRUNC);
   if (!file) {
     if (Serial) Serial.printf("[%lu] [%s] Failed to open file for writing: %s\n", millis(), moduleName, path);
@@ -344,6 +366,7 @@ uint64_t SDCardManager::sdUsedBytes() {
 }
 
 bool SDCardManager::removeDir(const char* path) {
+  if (!initialized) return false;
   auto dir = vol().open(path);
   if (!dir) {
     return false;

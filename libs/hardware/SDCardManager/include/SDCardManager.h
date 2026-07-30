@@ -32,6 +32,10 @@ class SDCardManager {
   SDCardManager();
   bool begin();
   bool ready() const;
+  // Performs one physical card command instead of trusting the cached mount
+  // state. A failed probe marks the mounted volume unavailable so subsequent
+  // filesystem calls fail immediately instead of repeating SD timeouts.
+  bool probeMedia();
   // Returns the total card capacity in bytes. Cached at begin(); 0 if not mounted.
   uint64_t sdTotalBytes() const;
   // Returns used space in bytes, cached with a 20-second TTL (freeClusterCount
@@ -53,12 +57,14 @@ class SDCardManager {
   // Ensure a directory exists, creating it if necessary. Returns true on success.
   bool ensureDirectoryExists(const char* path);
 
-  FsFile open(const char* path, const oflag_t oflag = O_RDONLY) { return vol().open(path, oflag); }
-  bool mkdir(const char* path, const bool pFlag = true) { return vol().mkdir(path, pFlag); }
-  bool exists(const char* path) { return vol().exists(path); }
-  bool remove(const char* path) { return vol().remove(path); }
-  bool rmdir(const char* path) { return vol().rmdir(path); }
-  bool rename(const char* path, const char* newPath) { return vol().rename(path, newPath); }
+  FsFile open(const char* path, const oflag_t oflag = O_RDONLY) {
+    return initialized ? vol().open(path, oflag) : FsFile{};
+  }
+  bool mkdir(const char* path, const bool pFlag = true) { return initialized && vol().mkdir(path, pFlag); }
+  bool exists(const char* path) { return initialized && vol().exists(path); }
+  bool remove(const char* path) { return initialized && vol().remove(path); }
+  bool rmdir(const char* path) { return initialized && vol().rmdir(path); }
+  bool rename(const char* path, const char* newPath) { return initialized && vol().rename(path, newPath); }
 
   bool openFileForRead(const char* moduleName, const char* path, FsFile& file);
   bool openFileForRead(const char* moduleName, const std::string& path, FsFile& file);
