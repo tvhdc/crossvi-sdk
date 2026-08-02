@@ -686,7 +686,13 @@ constexpr BoardProfile XTEINK_X4 = {Board::XteinkX4,
                                     NO_LEDS,
                                     NO_FLIP,
                                     NO_SDMMC,
-                                    NO_GAUGE};
+                                    NO_GAUGE,
+                                    NO_MIC,
+                                    NO_SENSORS,
+                                    1.0f,
+                                    // Newer X4 revisions require GPIO13 HIGH to keep the
+                                    // battery rail latched after the power button is released.
+                                    {13, PIN_UNASSIGNED}};
 
 // --- Xteink X3 — ESP32-C3, UC8253 (792x528) ----------------------------------
 // Same board/pinout as X4; differs only in panel controller + size. Selected at
@@ -1172,6 +1178,8 @@ constexpr BoardProfile DEFAULT_DEVICE = XTEINK_X4;
 // own hardware detection, before any pin is used.
 inline BoardProfile ACTIVE = DEFAULT_DEVICE;
 
+inline void holdPowerRails();  // defined below; used by selectDevice()
+
 // Set ACTIVE to one of the devices compiled into this build. Returns false (and
 // leaves ACTIVE unchanged) if `which` was not included via -DFREEINK_DEVICE_*.
 inline bool selectDevice(Board which) {
@@ -1179,55 +1187,56 @@ inline bool selectDevice(Board which) {
 #if FREEINK_DEVICE_X4
     case Board::XteinkX4:
       ACTIVE = XTEINK_X4;
-      return true;
+      break;
 #endif
 #if FREEINK_DEVICE_X3
     case Board::XteinkX3:
       ACTIVE = XTEINK_X3;
-      return true;
+      break;
     case Board::XteinkX3Uc8279:
       ACTIVE = XTEINK_X3_UC8279;
-      return true;
+      break;
 #endif
 #if FREEINK_DEVICE_M5
     case Board::M5StackPaperColor:
       ACTIVE = M5STACK_PAPER_COLOR;
-      return true;
+      break;
 #endif
 #if FREEINK_DEVICE_MURPHY
     case Board::MurphyM3:
       ACTIVE = MURPHY_M3;
-      return true;
+      break;
 #endif
 #if FREEINK_DEVICE_DELINK
     case Board::DeLink:
       ACTIVE = DE_LINK;
-      return true;
+      break;
 #endif
 #if FREEINK_DEVICE_LILYGO
     case Board::LilyGoT5S3:
       ACTIVE = LILYGO_T5S3;
-      return true;
+      break;
 #endif
 #if FREEINK_DEVICE_M5PAPER
     case Board::M5PaperV11:
       ACTIVE = M5PAPER_V11;
-      return true;
+      break;
 #endif
 #if FREEINK_DEVICE_STICKY
     case Board::Sticky:
       ACTIVE = STICKY;
-      return true;
+      break;
 #endif
 #if FREEINK_DEVICE_X4PRO
     case Board::XteinkX4Pro:
       ACTIVE = XTEINK_X4_PRO;
-      return true;
+      break;
 #endif
     default:
-      break;
+      return false;
   }
-  return false;
+  holdPowerRails();
+  return true;
 }
 
 inline bool isM5StackPaperColor() { return ACTIVE.board == Board::M5StackPaperColor; }
@@ -1248,6 +1257,7 @@ inline bool hasAudio() { return ACTIVE.audio.output != AudioOutput::None; }
 inline void holdPowerRails() {
   for (const int8_t pin : {ACTIVE.power.latch0, ACTIVE.power.latch1}) {
     if (pin >= 0) {
+      gpio_hold_dis(static_cast<gpio_num_t>(pin));
       pinMode(pin, OUTPUT);
       digitalWrite(pin, HIGH);
     }
