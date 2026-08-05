@@ -712,7 +712,10 @@ constexpr BoardProfile XTEINK_X3 = {
                // (https://www.elecrow.com/download/product/DIE01237S/UC8253_Datasheet.pdf)
                // Witch Reader (a CrossPoint fork) ran a conservative 16 MHz; 20 MHz is in-spec and ~25% faster
                // on plane writes. Falls back to the driver's 16 MHz default if set to 0.
-    {PIN_UNASSIGNED, 7, PIN_UNASSIGNED, 12, PIN_UNASSIGNED, false, 0},
+    // GPIO13 switches the X3 SD-card rail. Declaring it lets SD startup release
+    // a hold left by deep sleep and lets the shared power path cut the card's
+    // supply while sleeping. X4 keeps GPIO13 as its separate battery latch.
+    {PIN_UNASSIGNED, 7, PIN_UNASSIGNED, 12, 13, false, 0},
     {0, 1, 2, 3, 4, 5, 3, false},
     0,
     PIN_UNASSIGNED,
@@ -744,7 +747,7 @@ constexpr BoardProfile XTEINK_X3_UC8279 = {
     528,
     {8, 10, 21, 4, 5, 6, PIN_UNASSIGNED},
     20000000,
-    {PIN_UNASSIGNED, 7, PIN_UNASSIGNED, 12, PIN_UNASSIGNED, false, 0},
+    {PIN_UNASSIGNED, 7, PIN_UNASSIGNED, 12, 13, false, 0},
     {0, 1, 2, 3, 4, 5, 3, false},
     0,
     PIN_UNASSIGNED,
@@ -1250,17 +1253,26 @@ inline bool hasHomeKey() { return ACTIVE.touch.hasHomeKey; }
 inline bool hasPwmFrontlight() { return ACTIVE.frontlight.gpio != PIN_UNASSIGNED; }
 inline bool hasAudio() { return ACTIVE.audio.output != AudioOutput::None; }
 
+// Never drive a display or SDMMC bus pin as a power latch. A wrong runtime
+// profile would otherwise hold that bus line HIGH across boot or sleep.
+inline bool latchConflictsWithBus(int8_t pin) {
+  if (pin < 0) return false;
+  const DisplayPins& d = ACTIVE.display;
+  if (pin == d.sclk || pin == d.mosi || pin == d.cs || pin == d.dc || pin == d.rst || pin == d.busy) return true;
+  const SdmmcPins& s = ACTIVE.sdmmc;
+  return s.busWidth != 0 && (pin == s.clk || pin == s.cmd || pin == s.d0 || pin == s.d1 || pin == s.d2 || pin == s.d3);
+}
+
 // Assert the board's power-rail latch pins. Battery-latched boards (e.g. the
 // Sticky) must call this first thing in setup() or the board powers off when
 // the user releases the power button. Releasing the pins (driving them LOW)
 // is a software power-off. No-op on boards without a latch.
 inline void holdPowerRails() {
   for (const int8_t pin : {ACTIVE.power.latch0, ACTIVE.power.latch1}) {
-    if (pin >= 0) {
-      gpio_hold_dis(static_cast<gpio_num_t>(pin));
-      pinMode(pin, OUTPUT);
-      digitalWrite(pin, HIGH);
-    }
+    if (pin < 0 || latchConflictsWithBus(pin)) continue;
+    gpio_hold_dis(static_cast<gpio_num_t>(pin));
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, HIGH);
   }
 }
 

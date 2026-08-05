@@ -139,6 +139,7 @@ constexpr int8_t EPD_BUSY = 6;
 // UC8279d read-capable registers (UC8279d_B 0.1 datasheet).
 constexpr uint8_t UC8279_CMD_VER = 0x70;  // reserved, CHIP_VER, LUT_VER[23:0]
 constexpr uint8_t UC8279_CMD_FLG = 0x71;  // status; BUSY_N (D0) = 1 when idle
+constexpr uint8_t UC8279_CMD_RMTP = 0xA2;  // dummy byte, then MTP[0..n]
 
 inline void epdClockDelay() { delayMicroseconds(1); }  // ~500 kHz, timing-safe
 
@@ -183,21 +184,25 @@ void epdCmdRead(uint8_t cmd, uint8_t* out, uint8_t len) {
   pinMode(EPD_MOSI, OUTPUT);
 }
 
-// The UC8279 VER signature: a leading reserved 0x00, then a CHIP_VER byte
-// (datasheet default 0x03, MTP-programmed so not pinned to that exact value)
-// that is neither a floating-low nor a floating-high bus. A released SDA reads
-// back all-0x00 or all-0xFF through the pull-up, and the UC8253 places its
-// revision in the FIRST byte of its 0x70 read (UC815x-family REV layout), so a
-// genuine 0x00 lead followed by a non-trivial byte is discriminating. FLG must
-// additionally report idle (BUSY_N=1) without being a floating pattern.
-bool matchUc8279(const uint8_t ver[5], uint8_t flg) {
-  if (ver[0] != 0x00) return false;
-  if (ver[1] == 0x00 || ver[1] == 0xFF) return false;
+// Match on a real FLG status plus a non-uniform VER response. Some shipping
+// UC8279 units report CHIP_VER=0x00, so pinning the second byte to a particular
+// value rejects valid new X3 panels. A controller that does not answer leaves
+// the half-duplex line at a uniform all-low or all-high pattern instead.
+bool verIsFloating(const uint8_t ver[5]) {
+  for (int i = 1; i < 5; i++) {
+    if (ver[i] != ver[0]) return false;
+  }
+  return true;
+}
+
+bool flgIsDriven(uint8_t flg) {
   if (flg == 0x00 || flg == 0xFF) return false;
   return (flg & 0x01) == 0x01;
 }
 
-bool runDisplayProbePass(uint8_t ver[5], uint8_t* flg) {
+bool matchUc8279(const uint8_t ver[5], uint8_t flg) { return flgIsDriven(flg) && !verIsFloating(ver); }
+
+bool runDisplayProbePass(uint8_t ver[5], uint8_t* flg, uint8_t rstLowMs) {
   pinMode(EPD_CS, OUTPUT);
   digitalWrite(EPD_CS, HIGH);
   pinMode(EPD_SCLK, OUTPUT);
@@ -207,19 +212,16 @@ bool runDisplayProbePass(uint8_t ver[5], uint8_t* flg) {
   pinMode(EPD_MOSI, OUTPUT);
   pinMode(EPD_BUSY, INPUT);
 
-  // Hardware reset pulse (RST_N min low width 50 us; give it 1 ms) and wait
-  // for the controller to come ready (BUSY_N high). The panel driver's own
-  // begin() resets again afterwards, so this leaves no lasting state.
+  // Screen with a short reset first. Only a potential UC8279 match pays for a
+  // second pass using the vendor identification timing (RST low for 50 ms).
+  // The panel driver resets the controller again during begin().
   pinMode(EPD_RST, OUTPUT);
   digitalWrite(EPD_RST, HIGH);
   delay(2);
   digitalWrite(EPD_RST, LOW);
-  delay(1);
+  delay(rstLowMs);
   digitalWrite(EPD_RST, HIGH);
-  {
-    const unsigned long t0 = millis();
-    while (digitalRead(EPD_BUSY) == LOW && millis() - t0 < 30) delay(1);
-  }
+  delay(30);
 
   uint8_t flgByte = 0;
   epdCmdRead(UC8279_CMD_FLG, &flgByte, 1);
@@ -244,17 +246,36 @@ X3DisplayVerdict detectX3DisplayController(uint8_t verBytes[5], uint8_t* flg) {
   uint8_t ver1[5] = {0};
   uint8_t ver2[5] = {0};
   uint8_t flg1 = 0;
-  const bool pass1 = runDisplayProbePass(ver1, &flg1);
+  bool pass1 = runDisplayProbePass(ver1, &flg1, /*rstLowMs=*/1);
+  if (!pass1) {
+    // Some new X3 modules only answer reliably after the vendor's 50 ms
+    // identification reset. The established UC8253 path pays this once during
+    // boot, then remains on its existing driver when the bus still floats.
+    delay(2);
+    pass1 = runDisplayProbePass(ver1, &flg1, /*rstLowMs=*/50);
+  }
   delay(2);
-  const bool pass2 = runDisplayProbePass(ver2, nullptr);
+  const bool pass2 = runDisplayProbePass(ver2, nullptr, /*rstLowMs=*/pass1 ? 50 : 1);
+
+  const bool verAgree = memcmp(ver1, ver2, 5) == 0;
+  bool confirmed = pass1 && pass2 && verAgree;
+  if (!confirmed && flgIsDriven(flg1) && verAgree && verIsFloating(ver1) && ver1[0] == 0xFF) {
+    // Field units can report an unreadable all-FF VER even though a real
+    // UC8279 is present. RMTP returns one dummy byte followed by the programmed
+    // MTP refresh key 0xA5. UC8253 does not implement RMTP, so its released bus
+    // cannot satisfy this positive check.
+    uint8_t mtp[49] = {0};
+    epdCmdRead(UC8279_CMD_RMTP, mtp, sizeof(mtp));
+    confirmed = mtp[1] == 0xA5;
+  }
   releaseDisplayPins();
-  if (verBytes) memcpy(verBytes, ver1, 5);
+  if (verBytes) memcpy(verBytes, pass1 && pass2 ? ver2 : ver1, 5);
   if (flg) *flg = flg1;
   // Confirmed only when both passes match the UC8279 signature AND agree on
   // the VER bytes — a floating bus can't produce the same stable non-trivial
   // pattern twice. Disagreement is Inconclusive (resolve as UC8253, the
   // shipping controller, but don't persist so a flaky boot re-probes).
-  if (pass1 && pass2 && memcmp(ver1, ver2, 5) == 0) return X3DisplayVerdict::Uc8279Confirmed;
+  if (confirmed) return X3DisplayVerdict::Uc8279Confirmed;
   if (!pass1 && !pass2) return X3DisplayVerdict::Uc8253Assumed;
   return X3DisplayVerdict::Inconclusive;
 }
