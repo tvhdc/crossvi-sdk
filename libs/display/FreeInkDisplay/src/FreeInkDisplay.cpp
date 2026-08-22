@@ -49,11 +49,28 @@ namespace freeink {
 namespace {
 RefreshMode toInternal(FreeInkDisplay::RefreshMode m) {
   switch (m) {
-    case FreeInkDisplay::FULL_REFRESH: return RefreshMode::Full;
-    case FreeInkDisplay::HALF_REFRESH: return RefreshMode::Half;
-    default: return RefreshMode::Fast;
+    case FreeInkDisplay::FULL_REFRESH:
+      return RefreshMode::Full;
+    case FreeInkDisplay::HALF_REFRESH:
+      return RefreshMode::Half;
+    default:
+      return RefreshMode::Fast;
   }
 }
+
+#if defined(ENABLE_SERIAL_LOG)
+const char* freeinkModeName(const FreeInkDisplay::RefreshMode mode) {
+  switch (mode) {
+    case FreeInkDisplay::FULL_REFRESH:
+      return "FULL";
+    case FreeInkDisplay::HALF_REFRESH:
+      return "HALF";
+    case FreeInkDisplay::FAST_REFRESH:
+    default:
+      return "FAST";
+  }
+}
+#endif
 
 void invertBytes(uint8_t* buffer, const uint32_t size) {
   if (!buffer) return;
@@ -64,7 +81,8 @@ void invertBytes(uint8_t* buffer, const uint32_t size) {
 }  // namespace
 
 FreeInkDisplay::FreeInkDisplay(int8_t sclk, int8_t mosi, int8_t cs, int8_t dc, int8_t rst, int8_t busy)
-    : _pins{sclk, mosi, cs, dc, rst, busy}, frameBuffer(nullptr)
+    : _pins{sclk, mosi, cs, dc, rst, busy},
+      frameBuffer(nullptr)
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
       ,
       frameBufferActive(nullptr)
@@ -107,7 +125,7 @@ void FreeInkDisplay::selectDriver() {
 #if FREEINK_DRIVER_M5_OFFICIAL
       _driver = &m5OfficialDriver();  // M5 official M5GFX backend
 #else
-      _driver = &ed2208M5Driver();    // fast hand-rolled ED2208 backend
+      _driver = &ed2208M5Driver();  // fast hand-rolled ED2208 backend
 #endif
       break;
 #endif
@@ -346,10 +364,10 @@ uint8_t* FreeInkDisplay::lendBuildStorage(uint32_t* sizeOut) {
   }
   syncPendingAsync();  // a refresh in flight was reading these bytes
   _buildLent = true;
-  frameBuffer = nullptr;   // rendering is unavailable while the bytes are lent
-  _shadowValid = false;    // controller baseline no longer matches
+  frameBuffer = nullptr;                          // rendering is unavailable while the bytes are lent
+  _shadowValid = false;                           // controller baseline no longer matches
   if (sizeOut != nullptr) *sizeOut = bufferSize;  // full alloc is usable as scratch
-  return frameBuffer0;     // the allocation itself is never freed, so it never moves
+  return frameBuffer0;                            // the allocation itself is never freed, so it never moves
 }
 
 void FreeInkDisplay::returnBuildStorage() {
@@ -477,6 +495,27 @@ bool FreeInkDisplay::supportsAsyncRefresh() const {
   return !_inverted && !_inversionDirty && _driver != nullptr && _driver->supportsAsyncDisplay();
 }
 
+bool FreeInkDisplay::supportsFastLutProfiles() const { return _driver != nullptr && _driver->fastLutFrameCount() != 0; }
+
+void FreeInkDisplay::setFastLutFrameCount(const uint8_t frames) {
+  if (_driver != nullptr) _driver->setFastLutFrameCount(frames);
+}
+
+bool FreeInkDisplay::cleanFastGhosting() {
+  if (_driver == nullptr || frameBuffer == nullptr || _inversionDirty) return false;
+  syncPendingAsync();
+#ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  uint8_t* const onScreen = frameBuffer;
+#else
+  uint8_t* const onScreen = frameBufferActive ? frameBufferActive : frameBuffer;
+#endif
+  if (_inverted) invertBytes(onScreen, bufferSize);
+  const bool cleaned = _driver->cleanFastGhosting(_bus, onScreen);
+  if (_inverted) invertBytes(onScreen, bufferSize);
+  _refreshPending = cleaned;
+  return cleaned;
+}
+
 bool FreeInkDisplay::refreshBusy() {
   // Does NOT clear the pending state on completion: the driver's post-waveform
   // work (X3 DTM1 sync) must run through displayFinish(). When this returns
@@ -488,11 +527,23 @@ void FreeInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
   Serial.printf("[EPD] displayBuffer mode=%d off=%d\n", (int)mode, (int)turnOffScreen);
 #endif
+#if defined(ENABLE_SERIAL_LOG)
+  const RefreshMode requestedMode = mode;
+  const bool pendingBefore = _refreshPending;
+#endif
   syncPendingAsync();
   if (_inversionDirty && mode == FAST_REFRESH) {
     mode = HALF_REFRESH;
   }
 #ifdef EINK_DISPLAY_SINGLE_BUFFER_MODE
+#if defined(ENABLE_SERIAL_LOG)
+  if (Serial) {
+    Serial.printf("[%lu] [EPD] sdk_display req=%s eff=%s off=%u panel=%u pending_before=%u inv_dirty=%u single=1\n",
+                  millis(), freeinkModeName(requestedMode), freeinkModeName(mode), static_cast<unsigned>(turnOffScreen),
+                  static_cast<unsigned>(_panelSel), static_cast<unsigned>(pendingBefore),
+                  static_cast<unsigned>(_inversionDirty));
+  }
+#endif
   if (_inverted) invertBytes(frameBuffer, bufferSize);
   _driver->display(_bus, frameBuffer, nullptr, toInternal(mode), turnOffScreen);
   if (_inverted) invertBytes(frameBuffer, bufferSize);
@@ -503,6 +554,18 @@ void FreeInkDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
   const RefreshMode effMode = resolveReleasedMode(mode);
   uint8_t* const next = frameBuffer;
   const uint8_t* const prev = consumePrevFrameFor(effMode);
+#if defined(ENABLE_SERIAL_LOG)
+  if (Serial) {
+    Serial.printf(
+        "[%lu] [EPD] sdk_display req=%s post_inv=%s eff=%s off=%u panel=%u pending_before=%u inv_dirty=%u secondary=%u "
+        "single_fast_diff=%u prev=%u red_synced=%u red_auth=%u\n",
+        millis(), freeinkModeName(requestedMode), freeinkModeName(mode), freeinkModeName(effMode),
+        static_cast<unsigned>(turnOffScreen), static_cast<unsigned>(_panelSel), static_cast<unsigned>(pendingBefore),
+        static_cast<unsigned>(_inversionDirty), static_cast<unsigned>(frameBufferActive != nullptr),
+        static_cast<unsigned>(_singleBufferFastDiff), static_cast<unsigned>(prev != nullptr),
+        static_cast<unsigned>(_redRamSynced), static_cast<unsigned>(_redBaselineAuthoritative));
+  }
+#endif
   if (_inverted) {
     invertBytes(next, bufferSize);
     invertBytes(const_cast<uint8_t*>(prev), bufferSize);
@@ -600,8 +663,8 @@ void FreeInkDisplay::triggerDisplay(RefreshMode mode, bool turnOffScreen) {
   // into the inactive buffer while the just-displayed frame is preserved for the
   // X3 post-waveform DTM1 sync the driver stashed a pointer to.
   const RefreshMode effMode = resolveReleasedMode(mode);
-  const bool deferred = _driver->displayStart(_bus, frameBuffer, consumePrevFrameFor(effMode), toInternal(effMode),
-                                              turnOffScreen);
+  const bool deferred =
+      _driver->displayStart(_bus, frameBuffer, consumePrevFrameFor(effMode), toInternal(effMode), turnOffScreen);
   swapBuffers();
 #endif
   _refreshPending = deferred;
@@ -745,8 +808,7 @@ void FreeInkDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) {
   _driver->copyGrayscaleMsb(_bus, msbBuffer);
 }
 
-void FreeInkDisplay::writeGrayscalePlaneStrip(GrayPlane plane, const uint8_t* rows, uint16_t yStart,
-                                              uint16_t numRows) {
+void FreeInkDisplay::writeGrayscalePlaneStrip(GrayPlane plane, const uint8_t* rows, uint16_t yStart, uint16_t numRows) {
   if (_inverted) return;
   syncPendingAsync();  // no-op in the reader flow (it waits first); guards misuse
   _driver->writeGrayscalePlaneStrip(_bus, plane == GRAY_PLANE_LSB ? freeink::GrayPlane::Lsb : freeink::GrayPlane::Msb,
@@ -764,8 +826,7 @@ void FreeInkDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
   }
   // Restore frameBuffer so subsequent BW draws paint onto a valid BW baseline
   // rather than the stale LSB/MSB grayscale plane data that was there before.
-  if (frameBuffer && bwBuffer && frameBuffer != bwBuffer)
-    memcpy(frameBuffer, bwBuffer, bufferSize);
+  if (frameBuffer && bwBuffer && frameBuffer != bwBuffer) memcpy(frameBuffer, bwBuffer, bufferSize);
 }
 #ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
 void FreeInkDisplay::cleanupGrayscaleWithPreviousBuffer() {
@@ -773,8 +834,7 @@ void FreeInkDisplay::cleanupGrayscaleWithPreviousBuffer() {
   if (!_inverted) {
     _driver->cleanupGrayscaleBuffers(_bus, baseline);
   }
-  if (frameBuffer && baseline && frameBuffer != baseline)
-    memcpy(frameBuffer, baseline, bufferSize);
+  if (frameBuffer && baseline && frameBuffer != baseline) memcpy(frameBuffer, baseline, bufferSize);
 }
 #endif
 
@@ -794,9 +854,7 @@ void FreeInkDisplay::setFastRefreshCutoffMs(uint16_t ms) {
   if (_driver) _driver->setFastRefreshCutoffMs(ms);
 }
 
-uint16_t FreeInkDisplay::fastRefreshCutoffMs() const {
-  return _driver ? _driver->fastRefreshCutoffMs() : 0;
-}
+uint16_t FreeInkDisplay::fastRefreshCutoffMs() const { return _driver ? _driver->fastRefreshCutoffMs() : 0; }
 
 void FreeInkDisplay::grayscaleRevert() {
   if (!_inverted && _driver) _driver->grayscaleRevert(_bus, frameBuffer);

@@ -39,6 +39,20 @@ constexpr uint8_t CMD_DEEP_SLEEP = 0x10;
 constexpr uint8_t DRIVER_OUTPUT_SCAN = 0x02;  // SM=1 interlaced, TB=0 (base)
 constexpr uint8_t SCAN_TB_FLIP = 0x01;        // OR into the scan byte for mirrorY
 
+#if defined(ENABLE_SERIAL_LOG)
+const char* ssdModeName(const RefreshMode mode) {
+  switch (mode) {
+    case RefreshMode::Full:
+      return "FULL";
+    case RefreshMode::Half:
+      return "HALF";
+    case RefreshMode::Fast:
+    default:
+      return "FAST";
+  }
+}
+#endif
+
 }  // namespace
 
 const Ssd1677Config& ssd1677DefaultConfig() {
@@ -274,6 +288,14 @@ void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool as
       bus.cmd(CMD_WRITE_TEMP);
       bus.data(_cfg.halfRefreshTemp);
     }
+#if defined(ENABLE_SERIAL_LOG)
+    if (Serial) {
+      Serial.printf("[%lu] [EPD] x4_refresh mode=%s off=%u async=%u seq=0x%02X custom=%u screen_on=%u\n", millis(),
+                    ssdModeName(mode), static_cast<unsigned>(turnOff), static_cast<unsigned>(async),
+                    static_cast<unsigned>(seqOverride), static_cast<unsigned>(_customLutActive),
+                    static_cast<unsigned>(_isScreenOn));
+    }
+#endif
     bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
     bus.data(seqOverride);
     bus.cmd(CMD_MASTER_ACTIVATION);
@@ -313,6 +335,14 @@ void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool as
     displayMode |= _customLutActive ? 0x0C : 0x1C;
   }
 
+#if defined(ENABLE_SERIAL_LOG)
+  if (Serial) {
+    Serial.printf("[%lu] [EPD] x4_refresh mode=%s off=%u async=%u ctrl2=0x%02X custom=%u screen_on=%u\n", millis(),
+                  ssdModeName(mode), static_cast<unsigned>(turnOff), static_cast<unsigned>(async),
+                  static_cast<unsigned>(displayMode), static_cast<unsigned>(_customLutActive),
+                  static_cast<unsigned>(_isScreenOn));
+  }
+#endif
   bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
   bus.data(displayMode);
   bus.cmd(CMD_MASTER_ACTIVATION);
@@ -353,6 +383,12 @@ void Ssd1677Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
 
 void Ssd1677Driver::displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff,
                                 bool async) {
+#if defined(ENABLE_SERIAL_LOG)
+  const RefreshMode requestedMode = mode;
+  const bool screenWasOn = _isScreenOn;
+  const bool needsInitialFullBefore = _needsInitialFull;
+  const bool grayscaleWasOn = _inGrayscaleMode;
+#endif
   // The first paint after boot/wake must be an absolute clean, not a partial/DU
   // refresh: a partial only drives pixels that differ from the RED "old" plane, so
   // it can't clear what is physically on the panel at boot (e.g. the sleep screen).
@@ -393,6 +429,18 @@ void Ssd1677Driver::displayImpl(EpdBus& bus, const uint8_t* fb, const uint8_t* p
     }
   }
 
+#if defined(ENABLE_SERIAL_LOG)
+  if (Serial) {
+    Serial.printf(
+        "[%lu] [EPD] x4_display req=%s eff=%s off=%u async=%u prev=%u screen_on=%u needs_initial=%u gray=%u "
+        "half_seq=0x%02X full_seq=0x%02X fast_seq=0x%02X custom=%u\n",
+        millis(), ssdModeName(requestedMode), ssdModeName(mode), static_cast<unsigned>(turnOff),
+        static_cast<unsigned>(async), static_cast<unsigned>(prev != nullptr), static_cast<unsigned>(screenWasOn),
+        static_cast<unsigned>(needsInitialFullBefore), static_cast<unsigned>(grayscaleWasOn),
+        static_cast<unsigned>(_cfg.halfSeqOverride), static_cast<unsigned>(_cfg.fullSeqOverride),
+        static_cast<unsigned>(_cfg.fastSeqOverride), static_cast<unsigned>(_customLutActive));
+  }
+#endif
   setRamArea(bus, 0, 0, _w, _h);
 
   if (mode != RefreshMode::Fast) {

@@ -31,10 +31,10 @@ struct Uc8253LutBank {
 };
 
 struct Uc8253X3Config {
-  Uc8253LutBank normal;  // condition-pass / settle (CDI 0xA9)
-  Uc8253LutBank half;    // scrub (CDI 0xA9)
-  Uc8253LutBank fast;    // turbo differential (CDI 0x29)
-  Uc8253LutBank full;    // OEM full / factory (CDI 0x29)
+  Uc8253LutBank normal;    // condition-pass / settle (CDI 0xA9)
+  Uc8253LutBank half;      // scrub (CDI 0xA9)
+  Uc8253LutBank fast;      // turbo differential (CDI 0x29)
+  Uc8253LutBank full;      // OEM full / factory (CDI 0x29)
   Uc8253LutBank gc;        // OEM 4-level grayscale nudge (CDI 0x29)
   Uc8253LutBank preBwMid;  // OEM grayscale preconditioning settle (CDI 0xA9)
   // OEM standalone grayscale banks (partial long / full short). Reference only,
@@ -80,10 +80,14 @@ class Uc8253X3Driver : public PanelDriver {
 
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
+  uint8_t fastLutFrameCount() const override { return _fastLutFrames; }
+  void setFastLutFrameCount(uint8_t frames) override;
+  bool cleanFastGhosting(EpdBus& bus, const uint8_t* fb) override;
 
  private:
   void initController(EpdBus& bus);
   void loadBank(EpdBus& bus, const Uc8253LutBank& bank);
+  void loadProfiledFastBank(EpdBus& bus, bool absolute, uint8_t frames);
   void loadBankCdi(EpdBus& bus, uint8_t cdi0, uint8_t cdi1, const Uc8253LutBank& bank);
   void triggerRefresh(EpdBus& bus, bool turnOff);
 
@@ -105,15 +109,19 @@ class Uc8253X3Driver : public PanelDriver {
     bool lsbValid = false;
   } _grayState;
 
-  // Refresh split state: what displayStart() decided, replayed by displayFinish()
-  // for the post-waveform DTM1 sync + conditioning. _pendingRefresh guards against
-  // a displayFinish() with no matching displayStart(). The just-displayed frame is
-  // NOT stashed here: the facade re-supplies it fresh to displayFinish() because
-  // the caller may release/realloc the buffer holding it in the gap.
+  // Refresh split state: what displayStart() or fast ghost cleanup decided,
+  // replayed by displayFinish(). A cleanup needs only the BUSY completion; a
+  // normal display also performs the post-waveform DTM1 sync and conditioning.
+  // The just-displayed frame is not stashed because the facade re-supplies it.
   bool _pendingRefresh = false;
+  bool _pendingGhostCleanup = false;
   bool _pendingTurnOff = false;
   bool _pendingDoFullSync = false;
   bool _pendingFastMode = false;
+  bool _pendingRefreshStarted = false;
+  uint8_t _fastLutFrames = 19;
+  bool _fastGhostCleanupEligible = false;
+  bool _fastGhostCleanupGentle = false;
 };
 
 PanelDriver& uc8253X3Driver();

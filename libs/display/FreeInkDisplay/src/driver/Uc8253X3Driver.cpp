@@ -32,6 +32,47 @@ constexpr uint8_t CMD_LV_SELECTION = 0xE1;
 constexpr uint8_t CMD_PARTIAL_WINDOW = 0x90;
 constexpr uint8_t CMD_PARTIAL_IN = 0x91;
 constexpr uint8_t CMD_PARTIAL_OUT = 0x92;
+
+constexpr uint8_t X3_FAST_LUT_MIN_FRAMES = 5;
+constexpr uint8_t X3_FAST_LUT_DEFAULT_FRAMES = 19;
+constexpr uint8_t X3_FAST_CLEANUP_FRAMES = 10;
+constexpr uint8_t FAST_TIMING_OFFSETS[] = {1, 3, 4, 7};
+
+#if defined(ENABLE_SERIAL_LOG)
+const char* x3ModeName(const RefreshMode mode) {
+  switch (mode) {
+    case RefreshMode::Full:
+      return "FULL";
+    case RefreshMode::Half:
+      return "HALF";
+    case RefreshMode::Fast:
+    default:
+      return "FAST";
+  }
+}
+#endif
+
+constexpr uint8_t clampFastFrames(const uint8_t frames) {
+  return frames < X3_FAST_LUT_MIN_FRAMES       ? X3_FAST_LUT_MIN_FRAMES
+         : frames > X3_FAST_LUT_DEFAULT_FRAMES ? X3_FAST_LUT_DEFAULT_FRAMES
+                                               : frames;
+}
+
+constexpr uint8_t profiledFastTiming(const uint8_t base, const uint8_t slot, const uint8_t frames) {
+  const uint8_t boundedFrames = frames < X3_FAST_LUT_MIN_FRAMES       ? X3_FAST_LUT_MIN_FRAMES
+                                : frames > X3_FAST_LUT_DEFAULT_FRAMES ? X3_FAST_LUT_DEFAULT_FRAMES
+                                                                      : frames;
+  const uint8_t reduction = X3_FAST_LUT_DEFAULT_FRAMES - boundedFrames;
+  const uint8_t slotReduction = reduction / 4 + (slot < reduction % 4 ? 1 : 0);
+  return base > slotReduction ? static_cast<uint8_t>(base - slotReduction) : 0;
+}
+
+static_assert(profiledFastTiming(4, 0, 19) == 4 && profiledFastTiming(4, 3, 19) == 4);
+static_assert(profiledFastTiming(4, 0, 15) == 3 && profiledFastTiming(4, 3, 15) == 3);
+static_assert(profiledFastTiming(4, 0, 12) == 2 && profiledFastTiming(4, 3, 12) == 3);
+static_assert(profiledFastTiming(4, 0, 10) == 1 && profiledFastTiming(4, 3, 10) == 2);
+static_assert(profiledFastTiming(4, 0, 6) == 0 && profiledFastTiming(4, 3, 6) == 1);
+static_assert(profiledFastTiming(4, 0, 5) == 0 && profiledFastTiming(4, 3, 5) == 1);
 }  // namespace
 
 const Uc8253X3Config& uc8253X3DefaultConfig() {
@@ -43,10 +84,8 @@ const Uc8253X3Config& uc8253X3DefaultConfig() {
       {lut_x3_vcom_gc, lut_x3_ww_gc, lut_x3_bw_gc, lut_x3_wb_gc, lut_x3_bb_gc},
       {lut_x3_vcom_aa_pre_bw_mid, lut_x3_ww_aa_pre_bw_mid, lut_x3_bw_aa_pre_bw_mid, lut_x3_wb_aa_pre_bw_mid,
        lut_x3_bb_aa_pre_bw_mid},
-      {lut_x3_vcom_factory_p1, lut_x3_ww_factory_p1, lut_x3_bw_factory_p1, lut_x3_wb_factory_p1,
-       lut_x3_bb_factory_p1},
-      {lut_x3_vcom_factory_p2, lut_x3_ww_factory_p2, lut_x3_bw_factory_p2, lut_x3_wb_factory_p2,
-       lut_x3_bb_factory_p2},
+      {lut_x3_vcom_factory_p1, lut_x3_ww_factory_p1, lut_x3_bw_factory_p1, lut_x3_wb_factory_p1, lut_x3_bb_factory_p1},
+      {lut_x3_vcom_factory_p2, lut_x3_ww_factory_p2, lut_x3_bw_factory_p2, lut_x3_wb_factory_p2, lut_x3_bb_factory_p2},
       42,  // controller accepts 42 bytes of each 43-byte array
   };
   return cfg;
@@ -75,6 +114,25 @@ void Uc8253X3Driver::loadBank(EpdBus& bus, const Uc8253LutBank& bank) {
   bus.cmdData(CMD_LUT_BW, bank.bw, _cfg.lutLen);
   bus.cmdData(CMD_LUT_WB, bank.wb, _cfg.lutLen);
   bus.cmdData(CMD_LUT_BB, bank.bb, _cfg.lutLen);
+}
+
+void Uc8253X3Driver::loadProfiledFastBank(EpdBus& bus, const bool absolute, const uint8_t frames) {
+  const uint8_t* sources[] = {
+      _cfg.fast.vcom, absolute ? _cfg.fast.bw : _cfg.fast.ww, _cfg.fast.bw,
+      _cfg.fast.wb,   absolute ? _cfg.fast.wb : _cfg.fast.bb,
+  };
+  constexpr uint8_t commands[] = {CMD_LUT_VCOM, CMD_LUT_WW, CMD_LUT_BW, CMD_LUT_WB, CMD_LUT_BB};
+  uint8_t lut[42];
+  for (uint8_t table = 0; table < 5; ++table) {
+    for (uint8_t index = 0; index < _cfg.lutLen; ++index) {
+      lut[index] = pgm_read_byte(sources[table] + index);
+    }
+    for (uint8_t slot = 0; slot < sizeof(FAST_TIMING_OFFSETS); ++slot) {
+      const uint8_t offset = FAST_TIMING_OFFSETS[slot];
+      lut[offset] = profiledFastTiming(lut[offset], slot, frames);
+    }
+    bus.cmdData(commands[table], lut, _cfg.lutLen);
+  }
 }
 
 void Uc8253X3Driver::loadBankCdi(EpdBus& bus, uint8_t cdi0, uint8_t cdi1, const Uc8253LutBank& bank) {
@@ -149,6 +207,10 @@ void Uc8253X3Driver::begin(EpdBus& bus) {
   _forcedConditionPassesNext = 0;
   _inGrayscaleMode = false;
   _grayState = {};
+  _pendingGhostCleanup = false;
+  _pendingRefreshStarted = false;
+  _fastGhostCleanupEligible = false;
+  _fastGhostCleanupGentle = false;
   initController(bus);
 }
 
@@ -159,6 +221,15 @@ void Uc8253X3Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev
 
 bool Uc8253X3Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
   (void)prev;
+#if defined(ENABLE_SERIAL_LOG)
+  const RefreshMode requestedMode = mode;
+  const bool screenWasOn = _isScreenOn;
+  const bool grayscaleWasOn = _inGrayscaleMode;
+  const uint8_t initialFullSyncsBefore = _initialFullSyncsRemaining;
+#endif
+  _pendingGhostCleanup = false;
+  _fastGhostCleanupEligible = false;
+  _fastGhostCleanupGentle = false;
   if (!_isScreenOn && !turnOff) {
     mode = RefreshMode::Half;  // wake transition gets a stronger waveform
   }
@@ -173,6 +244,18 @@ bool Uc8253X3Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
       (!fastMode && !halfMode) || !_redRamSynced || _initialFullSyncsRemaining > 0 || forcedFullSync;
   const bool doHalfSync = halfMode && !doFullSync;
   _grayState.lastBaseWasPartial = !doFullSync;
+#if defined(ENABLE_SERIAL_LOG)
+  if (Serial) {
+    Serial.printf(
+        "[%lu] [EPD] x3_start req=%s eff=%s off=%u screen_on=%u gray=%u red_synced=%u initial=%u force=%u full=%u "
+        "half=%u fast_lut=%u\n",
+        millis(), x3ModeName(requestedMode), x3ModeName(mode), static_cast<unsigned>(turnOff),
+        static_cast<unsigned>(screenWasOn), static_cast<unsigned>(grayscaleWasOn),
+        static_cast<unsigned>(_redRamSynced), static_cast<unsigned>(initialFullSyncsBefore),
+        static_cast<unsigned>(forcedFullSync), static_cast<unsigned>(doFullSync), static_cast<unsigned>(doHalfSync),
+        static_cast<unsigned>(_fastLutFrames));
+  }
+#endif
 
   if (doFullSync) {
     // _full OEM bank from a white DTM1 baseline (no software prev-frame buffer).
@@ -186,7 +269,8 @@ bool Uc8253X3Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
     bus.sendPlaneFlipped(CMD_DTM2, fb, _h, _wb);
   } else {
     // _fast turbo differential; DTM1 retains the previous frame.
-    loadBankCdi(bus, 0x29, 0x07, _cfg.fast);
+    bus.cmdData2(CMD_VCOM_DATA_INTERVAL, 0x29, 0x07);
+    loadProfiledFastBank(bus, false, _fastLutFrames);
     bus.sendPlaneFlipped(CMD_DTM2, fb, _h, _wb);
   }
 
@@ -205,7 +289,14 @@ bool Uc8253X3Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
     const int8_t busyPin = bus.pins().busy;
     const unsigned long t0 = millis();
     while (digitalRead(busyPin) == HIGH && millis() - t0 < 50) delay(1);
+    _pendingRefreshStarted = digitalRead(busyPin) == LOW;
   }
+#ifdef ENABLE_SERIAL_LOG
+  if (turnOff && doFullSync && Serial) {
+    Serial.printf("[%lu] [SLW] X3 terminal OEM full fired busy_started=%u\n", millis(),
+                  static_cast<unsigned>(_pendingRefreshStarted));
+  }
+#endif
   _pendingTurnOff = turnOff;
   _pendingDoFullSync = doFullSync;
   _pendingFastMode = fastMode;
@@ -216,14 +307,43 @@ bool Uc8253X3Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t*
 void Uc8253X3Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
   if (!_pendingRefresh) return;
   _pendingRefresh = false;
+  const bool ghostCleanup = _pendingGhostCleanup;
+  _pendingGhostCleanup = false;
   const bool turnOff = _pendingTurnOff;
   const bool doFullSync = _pendingDoFullSync;
   const bool fastMode = _pendingFastMode;
+  const bool refreshStarted = _pendingRefreshStarted;
+  _pendingRefreshStarted = false;
+  const bool finalSleepParking = turnOff && doFullSync;
 
   // ISR-backed wait: displayStart() already confirmed BUSY dropped LOW, so the
   // waveform is running and waitRefreshComplete() will wake on the exact
   // completion edge rather than polling at 1 ms granularity.
-  bus.waitRefreshComplete(" X3_DRF");
+  const RefreshWaitResult refreshResult = bus.waitRefreshComplete(" X3_DRF", refreshStarted);
+  if (ghostCleanup) {
+    _redRamSynced = refreshResult == RefreshWaitResult::Completed;
+    _fastGhostCleanupGentle = false;
+    return;
+  }
+  if (finalSleepParking) {
+#ifdef ENABLE_SERIAL_LOG
+    if (Serial) {
+      Serial.printf("[%lu] [SLW] X3 terminal OEM full result=%u; powering panel off\n", millis(),
+                    static_cast<unsigned>(refreshResult));
+    }
+#endif
+    bus.cmd(CMD_POWER_OFF);
+    bus.waitBusy(" X3_POF");
+    _isScreenOn = false;
+    _grayState.lsbValid = false;
+    _redRamSynced = false;
+    if (_initialFullSyncsRemaining > 0) _initialFullSyncsRemaining--;
+    _forceFullSyncNext = false;
+    _forcedConditionPassesNext = 0;
+    _fastGhostCleanupEligible = false;
+    _fastGhostCleanupGentle = false;
+    return;
+  }
   if (turnOff) {
     bus.cmd(CMD_POWER_OFF);
     bus.waitBusy(" X3_POF");
@@ -234,8 +354,10 @@ void Uc8253X3Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
 
   uint8_t postConditionPasses = 0;
   if (doFullSync) {
-    if (_forceFullSyncNext) postConditionPasses = _forcedConditionPassesNext;
-    else if (_initialFullSyncsRemaining == 1) postConditionPasses = 1;
+    if (_forceFullSyncNext)
+      postConditionPasses = _forcedConditionPassesNext;
+    else if (_initialFullSyncsRemaining == 1)
+      postConditionPasses = 1;
   }
   if (postConditionPasses > 0) {
     const uint16_t xEnd = static_cast<uint16_t>(_w - 1);
@@ -278,6 +400,45 @@ void Uc8253X3Driver::displayFinish(EpdBus& bus, const uint8_t* fb) {
   }
   _forceFullSyncNext = false;
   _forcedConditionPassesNext = 0;
+  _fastGhostCleanupEligible = fastMode && !doFullSync && !turnOff;
+  _fastGhostCleanupGentle = false;
+}
+
+void Uc8253X3Driver::setFastLutFrameCount(const uint8_t frames) {
+  _fastLutFrames = clampFastFrames(frames);
+  _fastGhostCleanupEligible = false;
+  _fastGhostCleanupGentle = false;
+}
+
+bool Uc8253X3Driver::cleanFastGhosting(EpdBus& bus, const uint8_t* fb) {
+  if (!fb || !_fastGhostCleanupEligible || _pendingRefresh || _inGrayscaleMode || _grayState.lsbValid) return false;
+  _fastGhostCleanupEligible = false;
+
+  if (_fastGhostCleanupGentle) {
+    // Grayscale pages leave a BW baseline in both controller planes. Re-fire
+    // only the fast bank's gentle WW/BB cells so residual charge is nudged
+    // toward the visible page without replacing its gray levels outright.
+    bus.cmdData2(CMD_VCOM_DATA_INTERVAL, 0x29, 0x07);
+    loadProfiledFastBank(bus, false, X3_FAST_CLEANUP_FRAMES);
+  } else {
+    // Plain BW pages can use the stronger absolute form: black targets use BW
+    // for both old colors, white targets use WB for both old colors.
+    bus.cmdData2(CMD_VCOM_DATA_INTERVAL, 0xA9, 0x07);
+    loadProfiledFastBank(bus, true, X3_FAST_CLEANUP_FRAMES);
+  }
+  if (!_isScreenOn) {
+    bus.cmd(CMD_POWER_ON);
+    bus.waitBusy(" X3_PON");
+    _isScreenOn = true;
+  }
+  bus.cmd(CMD_DISPLAY_REFRESH);
+  const int8_t busyPin = bus.pins().busy;
+  const unsigned long startedAt = millis();
+  while (digitalRead(busyPin) == HIGH && millis() - startedAt < 50) delay(1);
+  _pendingRefreshStarted = digitalRead(busyPin) == LOW;
+  _pendingGhostCleanup = true;
+  _pendingRefresh = true;
+  return true;
 }
 
 void Uc8253X3Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) {
@@ -321,6 +482,7 @@ void Uc8253X3Driver::displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, Refres
 }
 
 void Uc8253X3Driver::preconditionGrayscale(EpdBus& bus, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  _fastGhostCleanupEligible = false;
   // OEM V5.6.33 "AA-pre-BW(mid)" pass: gentle settle of the displayed BW
   // frame (DTM1 == DTM2 == frame after display()'s post-refresh DTM1 sync)
   // that leaves particles receptive to the weak grayscale nudge waveform.
@@ -360,6 +522,7 @@ void Uc8253X3Driver::preconditionGrayscale(EpdBus& bus, uint16_t x, uint16_t y, 
 }
 
 void Uc8253X3Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
+  _fastGhostCleanupEligible = false;
   if (!lsb) {
     _grayState.lsbValid = false;
     return;
@@ -377,6 +540,7 @@ void Uc8253X3Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
 
 void Uc8253X3Driver::writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, const uint8_t* rows, uint16_t yStart,
                                               uint16_t numRows) {
+  _fastGhostCleanupEligible = false;
   if (!rows || numRows == 0) return;
   // PTL partial-window in GATE space (logical row y lives at gate H-1-y), rows
   // emitted bottom-first so they land at the same gates the full-frame write
@@ -409,6 +573,7 @@ void Uc8253X3Driver::writeGrayscalePlaneStrip(EpdBus& bus, GrayPlane plane, cons
 
 void Uc8253X3Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
                                  bool factoryMode) {
+  _fastGhostCleanupEligible = false;
   (void)fb;
   (void)lut;
   if (!_grayState.lsbValid) return;
@@ -435,6 +600,8 @@ void Uc8253X3Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 }
 
 void Uc8253X3Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
+  _fastGhostCleanupEligible = false;
+  _fastGhostCleanupGentle = false;
   if (!bw) return;
   // Rebase both planes from the restored BW buffer (same data to DTM1 + DTM2).
   bus.sendPlaneFlipped(CMD_DTM2, bw, _h, _wb);
@@ -449,9 +616,12 @@ void Uc8253X3Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
   _forceFullSyncNext = false;
   _forcedConditionPassesNext = 0;
   _inGrayscaleMode = false;
+  _fastGhostCleanupEligible = true;
+  _fastGhostCleanupGentle = true;
 }
 
 void Uc8253X3Driver::grayscaleRevert(EpdBus& bus, const uint8_t* fb) {
+  _fastGhostCleanupEligible = false;
   (void)fb;
   if (!_inGrayscaleMode) return;
   _inGrayscaleMode = false;
@@ -470,6 +640,7 @@ void Uc8253X3Driver::grayscaleRevert(EpdBus& bus, const uint8_t* fb) {
 }
 
 void Uc8253X3Driver::requestResync(uint8_t settlePasses) {
+  _fastGhostCleanupEligible = false;
   _forceFullSyncNext = true;
   _forcedConditionPassesNext = settlePasses;
 }
@@ -480,6 +651,13 @@ void Uc8253X3Driver::skipInitialResync() {
 }
 
 void Uc8253X3Driver::deepSleep(EpdBus& bus) {
+  _fastGhostCleanupEligible = false;
+#ifdef ENABLE_SERIAL_LOG
+  if (Serial) {
+    Serial.printf("[%lu] [SLW] X3 controller deep-sleep begin screen_on=%u refresh_pending=%u\n", millis(),
+                  static_cast<unsigned>(_isScreenOn), static_cast<unsigned>(_pendingRefresh));
+  }
+#endif
   if (_isScreenOn) {
     bus.cmd(CMD_POWER_OFF);
     bus.waitBusy(" X3 power-down");
@@ -487,6 +665,9 @@ void Uc8253X3Driver::deepSleep(EpdBus& bus) {
   }
   bus.cmd(CMD_DEEP_SLEEP);
   bus.data(0xA5);
+#ifdef ENABLE_SERIAL_LOG
+  if (Serial) Serial.printf("[%lu] [SLW] X3 controller deep-sleep command sent\n", millis());
+#endif
 }
 
 // Per-board waveform/LUT injection: a board that drives a different UC8253 panel

@@ -23,6 +23,34 @@ static void IRAM_ATTR epdBusyIsr() {
   if (woken) portYIELD_FROM_ISR();
 }
 
+namespace {
+#ifdef ENABLE_SERIAL_LOG
+const char* refreshWaitResultName(const RefreshWaitResult result) {
+  switch (result) {
+    case RefreshWaitResult::Completed:
+      return "completed";
+    case RefreshWaitResult::NeverStarted:
+      return "never-started";
+    case RefreshWaitResult::TimedOut:
+      return "timed-out";
+  }
+  return "unknown";
+}
+#endif
+
+void logRefreshWaitResult(const char* tag, const RefreshWaitResult result, const unsigned long startedAt) {
+#ifdef ENABLE_SERIAL_LOG
+  if (tag && Serial) {
+    Serial.printf("[%lu]   BUSY %s: %s (%lu ms)\n", millis(), refreshWaitResultName(result), tag, millis() - startedAt);
+  }
+#else
+  (void)tag;
+  (void)result;
+  (void)startedAt;
+#endif
+}
+}  // namespace
+
 void EpdBus::begin(const EpdPins& pins, uint32_t spiHz, BusyPolarity busy, int8_t spiMiso, int8_t coCs) {
   _pins = pins;
   _spiHz = spiHz;
@@ -145,9 +173,9 @@ void EpdBus::rawWriteBytes(const uint8_t* d, uint16_t len) {
   SPI.writeBytes(d, len);
 }
 
-void EpdBus::waitBusy(const char* tag) { waitBusy(_busy, tag); }
+RefreshWaitResult EpdBus::waitBusy(const char* tag) { return waitBusy(_busy, tag); }
 
-void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
+RefreshWaitResult EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   const unsigned long start = millis();
   // Both hooks engage lazily, only once the wait has proven long (see
   // setBusyWaitHooks). longWait gates the slice hook independently of the
@@ -224,18 +252,14 @@ void EpdBus::waitBusy(BusyPolarity p, const char* tag) {
   }
 
   if (hookFired && _busyWaitEndHook != nullptr) _busyWaitEndHook();
-  if (p == BusyPolarity::X3TwoPhase && !x3SawLow) return;
-
-  if (tag && Serial) {
-    if (timedOut) {
-      Serial.printf("[%lu]   Wait timed out: %s (%lu ms)\n", millis(), tag, millis() - start);
-    } else {
-      Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), tag, millis() - start);
-    }
-  }
+  const RefreshWaitResult result = timedOut                                     ? RefreshWaitResult::TimedOut
+                                   : p == BusyPolarity::X3TwoPhase && !x3SawLow ? RefreshWaitResult::NeverStarted
+                                                                                : RefreshWaitResult::Completed;
+  logRefreshWaitResult(tag, result, start);
+  return result;
 }
 
-void EpdBus::waitRefreshComplete(const char* tag) {
+RefreshWaitResult EpdBus::waitRefreshComplete(const char* tag, const bool workingObserved) {
   // A host that installed a busy-wait slice hook (e.g. CrossPoint light-sleeping
   // through the refresh) must keep the polling path: waitBusy() invokes the slice
   // hook on each idle step, while this ISR path sleeps the task on a semaphore and
@@ -246,15 +270,13 @@ void EpdBus::waitRefreshComplete(const char* tag) {
   // slice hook already delivers GPIO-precise wake, so the ISR path buys these hosts
   // nothing — fall back to the hooked poll.
   if (_busyWaitSliceHook != nullptr) {
-    waitBusy(tag);
-    return;
+    return waitBusy(tag);
   }
   // ISR-driven completion wait: sleep the task on a semaphore and wake on the
   // exact BUSY completion edge, instead of polling every 1 ms. Falls back to
   // polling if the semaphore could not be created.
   if (!s_epdRefreshDone) {
-    waitBusy(tag);
-    return;
+    return waitBusy(tag);
   }
   // Levels/edge by polarity. X4 (ActiveHigh): working HIGH, done on the HIGH->LOW
   // (FALLING) edge. X3 (X3TwoPhase) / ActiveLow: working LOW, done on the LOW->HIGH
@@ -264,6 +286,7 @@ void EpdBus::waitRefreshComplete(const char* tag) {
   const int doneLevel = activeHigh ? LOW : HIGH;
   const int workingLevel = activeHigh ? HIGH : LOW;
   const unsigned long start = millis();
+  bool sawWorking = workingObserved || digitalRead(_pins.busy) == workingLevel;
 
   // Confirm the waveform is actually running (BUSY at the working level) before
   // arming, so the already-done fast path below can't mistake the pre-start idle
@@ -271,9 +294,10 @@ void EpdBus::waitRefreshComplete(const char* tag) {
   // refresh was a no-op or already finished, and the fast path handles it. This
   // is a no-op for X3 (displayStart already drove BUSY to LOW) and ~instant for
   // X4 (SSD1677 asserts BUSY within microseconds of MASTER_ACTIVATION).
-  {
+  if (!sawWorking) {
     const unsigned long c0 = millis();
     while (digitalRead(_pins.busy) != workingLevel && millis() - c0 < 20) delay(1);
+    sawWorking = digitalRead(_pins.busy) == workingLevel;
   }
 
   xSemaphoreTake(s_epdRefreshDone, 0);  // drain any stale token
@@ -286,19 +310,23 @@ void EpdBus::waitRefreshComplete(const char* tag) {
   if (digitalRead(_pins.busy) == doneLevel) {
     detachInterrupt(digitalPinToInterrupt(_pins.busy));
     xSemaphoreTake(s_epdRefreshDone, 0);
-    return;
+    const RefreshWaitResult result = sawWorking ? RefreshWaitResult::Completed : RefreshWaitResult::NeverStarted;
+    logRefreshWaitResult(tag, result, start);
+    return result;
   }
 
   // Long sleep — fire the power hooks (if any) around it, matching the poll path.
   const bool hook = (_busyWaitBeginHook != nullptr);
   if (hook) _busyWaitBeginHook();
-  xSemaphoreTake(s_epdRefreshDone, pdMS_TO_TICKS(30000));
+  const BaseType_t waitResult = xSemaphoreTake(s_epdRefreshDone, pdMS_TO_TICKS(30000));
   if (hook && _busyWaitEndHook != nullptr) _busyWaitEndHook();
 
   detachInterrupt(digitalPinToInterrupt(_pins.busy));
-  if (tag && Serial) {
-    Serial.printf("[%lu]   Wait complete: %s (%lu ms)\n", millis(), tag, millis() - start);
-  }
+  const RefreshWaitResult result = waitResult == pdTRUE || digitalRead(_pins.busy) == doneLevel
+                                       ? RefreshWaitResult::Completed
+                                       : RefreshWaitResult::TimedOut;
+  logRefreshWaitResult(tag, result, start);
+  return result;
 }
 
 void EpdBus::writeMirroredPlane(const uint8_t* plane, uint16_t height, uint16_t widthBytes, bool invert) {

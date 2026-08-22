@@ -65,8 +65,10 @@ class FreeInkDisplay {
 
   // Frame buffer operations
   void clearScreen(uint8_t color = 0xFF) const;
-  void drawImage(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool fromProgmem = false) const;
-  void drawImageTransparent(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool fromProgmem = false) const;
+  void drawImage(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                 bool fromProgmem = false) const;
+  void drawImageTransparent(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                            bool fromProgmem = false) const;
   // Persistent black/white output inversion. Framebuffers remain in their
   // normal logical colors, so callers keep drawing exactly as before; the
   // facade transforms frames only while sending them to the panel. The first
@@ -143,6 +145,12 @@ class FreeInkDisplay {
   // can skip overlap scaffolding (e.g. whole-plane grayscale buffers) when
   // there is nothing to overlap.
   bool supportsAsyncRefresh() const;
+
+  // UC8253 X3-only fast page-turn profiles. Other controllers report false
+  // and ignore the setter/cleanup call.
+  bool supportsFastLutProfiles() const;
+  void setFastLutFrameCount(uint8_t frames);
+  bool cleanFastGhosting();
 
   // ------------------------------------------------------------------------
   // CrossPoint EInkDisplay compatibility surface.

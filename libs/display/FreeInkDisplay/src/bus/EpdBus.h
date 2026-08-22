@@ -19,6 +19,12 @@ enum class BusyPolarity : uint8_t {
   X3TwoPhase,  // UC8253 (X3): wait for the LOW edge, then wait back to HIGH
 };
 
+enum class RefreshWaitResult : uint8_t {
+  Completed,
+  NeverStarted,
+  TimedOut,
+};
+
 struct EpdPins {
   int8_t sclk;
   int8_t mosi;
@@ -53,19 +59,19 @@ class EpdBus {
   // Grouped transaction primitives (used by multi-step sequences, e.g. M5).
   void beginTxn();
   void endTxn();
-  void rawCmd(uint8_t c);                            // assumes a transaction is open
-  void rawData(uint8_t d);                           // assumes a transaction is open
+  void rawCmd(uint8_t c);                              // assumes a transaction is open
+  void rawData(uint8_t d);                             // assumes a transaction is open
   void rawWriteBytes(const uint8_t* d, uint16_t len);  // bulk data, transaction open
 
   // Wait for a refresh/operation to finish using the configured (or given) polarity.
-  void waitBusy(const char* tag = nullptr);
-  void waitBusy(BusyPolarity p, const char* tag = nullptr);
+  RefreshWaitResult waitBusy(const char* tag = nullptr);
+  RefreshWaitResult waitBusy(BusyPolarity p, const char* tag = nullptr);
 
   // Like waitBusy(), but sleeps the calling task on a BUSY-edge interrupt and
   // wakes exactly on the completion edge instead of polling every 1 ms. For the
   // refresh-completion wait: it confirms the waveform is running (short bounded
   // poll) before arming, so it is safe to call right after firing the refresh.
-  void waitRefreshComplete(const char* tag = nullptr);
+  RefreshWaitResult waitRefreshComplete(const char* tag = nullptr, bool workingObserved = false);
 
   // Instantaneous BUSY-pin read for non-blocking refresh polling. X3's
   // two-phase wait can't be captured in a single read; its terminal state is
